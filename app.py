@@ -61,14 +61,16 @@ with st.sidebar:
 # 主区域
 if query_mode == "常用路线预设":
     preset_labels = [
-        f"1. M109 → M127",
-        f"2. M111 → M127",
-        f"3. M127 → M170/1",
-        f"4. M127 → M170/2",
+        f"1. {COMMON_ROUTES[0][2]} → {COMMON_ROUTES[0][3]}",
+        f"2. {COMMON_ROUTES[1][2]} → {COMMON_ROUTES[1][3]}",
+        f"3. {COMMON_ROUTES[2][2]} → {COMMON_ROUTES[2][3]}",
+        f"4. {COMMON_ROUTES[3][2]} → {COMMON_ROUTES[3][3]}",
+        f"5. {COMMON_ROUTES[4][2]} → {COMMON_ROUTES[4][3]}",
+        f"6. {COMMON_ROUTES[5][2]} → {COMMON_ROUTES[5][3]}",
     ]
     preset_choice = st.selectbox("选择常用路线", preset_labels, index=0)
     idx = int(preset_choice[0]) - 1
-    start_station, end_station = COMMON_ROUTES[idx]
+    start_station, end_station = COMMON_ROUTES[idx][0], COMMON_ROUTES[idx][1]
     route_specified = None
 
 elif query_mode == "站点查询（全路线）":
@@ -171,7 +173,5 @@ if st.button("🔍 查询", type="primary", use_container_width=True):
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**常用路线**")
-st.sidebar.markdown("1. M109→M127  ")
-st.sidebar.markdown("2. M111→M127  ")
-st.sidebar.markdown("3. M127→M170/1")
-st.sidebar.markdown("4. M127→M170/2")
+for i, r in enumerate(COMMON_ROUTES, 1):
+    st.sidebar.markdown(f"{i}. {r[2]}→{r[3]}")

@@ -9,8 +9,9 @@
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -21,14 +22,31 @@ HEADERS = {
     "Referer": "https://bis.dsat.gov.mo/macauweb/",
 }
 REQUEST_DELAY = 0.3  # 请求间隔，避免过快
+STATIC_FETCH_WORKERS = 6  # 并发获取静态数据的线程数
 
-# 常用路线预设（起始站 → 结束站），可用数字 1–4 快速选择
+# 缓存：静态数据 (route, dir) -> data；路线筛选 (start, end) -> [(route, dir), ...]
+_static_cache: dict = {}
+_routes_passing_cache: dict = {}
+
+# 常用路线预设（起始站代码, 结束站代码, 起始站名称, 结束站名称），可用数字 1–6 快速选择
 COMMON_ROUTES = [
-    ("M109", "M127"),   # 1
-    ("M111", "M127"),   # 2
-    ("M127", "M170/1"), # 3
-    ("M127", "M170/2"), # 4
+    ("M109", "M127", "提督/高士德", "海邊新街"),           # 1
+    ("M111", "M127", "昌明花園", "海邊新街"),             # 2
+    ("M127", "M170/1", "海邊新街", "殷皇子馬路(1)"),      # 3
+    ("M127", "M170/2", "海邊新街", "殷皇子馬路(2)"),      # 4
+    ("M109", "M170/1", "提督/高士德", "殷皇子馬路(1)"),   # 5
+    ("M111", "M170/2", "昌明花園", "殷皇子馬路(2)"),      # 6
 ]
+
+# 硬编码：6 条预设路线经过的巴士 (route, direction)，直接跳过静态数据排查
+PRESET_ROUTES_MAP = {
+    ("M109", "M127"): [("26A", "0"), ("26", "0"), ("33", "0")],
+    ("M111", "M127"): [("3", "0"), ("1", "0"), ("3X", "0"), ("6A", "0"), ("16", "0"), ("16S", "0"), ("N1B", "0")],
+    ("M127", "M170/1"): [("26A", "0"), ("33", "0")],
+    ("M127", "M170/2"): [("3", "0"), ("3X", "0"), ("101", "0"), ("N1B", "0")],
+    ("M109", "M170/1"): [("26A", "0"), ("33", "0")],
+    ("M111", "M170/2"): [("3", "0"), ("3X", "0"), ("N1B", "0")],
+}
 
 
 def _http_get(url: str, params: Optional[dict] = None, timeout: int = 15) -> dict:
@@ -90,18 +108,91 @@ def get_all_routes(lang: str = "tc") -> List[str]:
     return []
 
 
-def get_route_static_data(route_name: str, direction: str = "0", lang: str = "tc") -> Optional[dict]:
-    """获取路线静态数据（站点列表等）"""
+def get_route_static_data(
+    route_name: str, direction: str = "0", lang: str = "tc", use_cache: bool = True
+) -> Optional[dict]:
+    """获取路线静态数据（站点列表等），支持缓存"""
+    cache_key = (route_name, direction)
+    if use_cache and cache_key in _static_cache:
+        return _static_cache[cache_key]
     url = f"{BIS_BASE}/getRouteData.html"
     params = {"action": "sd", "routeName": route_name, "dir": direction, "lang": lang}
     try:
         data = _http_get(url, params=params, timeout=15)
         h = data.get("header")
         if h == "000" or (isinstance(h, dict) and h.get("status") == "000"):
-            return data.get("data")
+            result = data.get("data")
+            if use_cache and result:
+                _static_cache[cache_key] = result
+            return result
     except Exception as e:
         print(f"获取路线数据失败: {e}")
     return None
+
+
+def _fetch_static_and_check(
+    route: str, direction: str, start_station: str, end_station: str
+) -> Optional[Tuple[str, str]]:
+    """获取静态数据并检查是否经过 A→B，返回 (route, dir) 或 None"""
+    static = get_route_static_data(route, direction, use_cache=True)
+    if not static or "routeInfo" not in static:
+        return None
+    route_static = static.get("routeInfo", [])
+    for i, st in enumerate(route_static):
+        if st.get("staCode") == start_station:
+            for j in range(i + 1, len(route_static)):
+                if route_static[j].get("staCode") == end_station:
+                    return (route, direction)
+            break
+    return None
+
+
+def get_routes_passing_stations(
+    start_station: str, end_station: str, routes: Optional[List[str]] = None
+) -> List[Tuple[str, str]]:
+    """
+    两阶段优化：先排查所有路线，只保留经过 A→B 的 (route, direction)。
+    6 条预设路线使用硬编码，直接跳过静态数据排查；否则结果缓存。
+    """
+    cache_key = (start_station, end_station)
+    if cache_key in PRESET_ROUTES_MAP:
+        return list(PRESET_ROUTES_MAP[cache_key])
+    if cache_key in _routes_passing_cache:
+        return _routes_passing_cache[cache_key]
+
+    if routes is None:
+        routes = get_all_routes()
+    if not routes:
+        routes_file = Path(__file__).parent / "data" / "bus_routes.json"
+        if routes_file.exists():
+            with open(routes_file, encoding="utf-8") as f:
+                routes = [r.get("route_no", "") for r in json.load(f) if r.get("route_no")]
+
+    passing: List[Tuple[str, str]] = []
+    tasks = []
+    for route in routes:
+        for direction in ("0", "1"):
+            tasks.append((route, direction))
+
+    def _task(t: Tuple[str, str]) -> Optional[Tuple[str, str]]:
+        r, d = t
+        return _fetch_static_and_check(r, d, start_station, end_station)
+
+    with ThreadPoolExecutor(max_workers=STATIC_FETCH_WORKERS) as executor:
+        futures = {executor.submit(_task, t): t for t in tasks}
+        for future in as_completed(futures):
+            if future.result():
+                passing.append(future.result())
+
+    _routes_passing_cache[cache_key] = passing
+    return passing
+
+
+def clear_route_caches() -> None:
+    """清除路线筛选与静态数据缓存（路线调整后可调用）"""
+    global _static_cache, _routes_passing_cache
+    _static_cache.clear()
+    _routes_passing_cache.clear()
 
 
 def get_realtime_bus_data(route_name: str, direction: str = "0", lang: str = "tc") -> Optional[dict]:
@@ -211,117 +302,96 @@ def get_buses_by_stations_only(
     1) 即将到达起始站并会经过这两站的车
     2) 当前在这两站之间运行的车
 
-    Args:
-        start_station: 起始站代码（如 M23）
-        end_station: 结束站代码（如 M177）
-        routes: 可选，指定要检查的路线列表；None 则检查全部路线
-
-    Returns:
-        stationA, stationB: 站点信息
-        approachingStart: 即将到达起始站的车 [{route, busPlate, positionBetween, ...}, ...]
-        betweenStations: 当前在两站之间运行的车
+    优化：两阶段查询——先排查所有路线筛出经过 A→B 的，再只对筛选结果查实时数据。
     """
-    if routes is None:
-        routes = get_all_routes()
-    if not routes:
-        routes_file = Path(__file__).parent / "data" / "bus_routes.json"
-        if routes_file.exists():
-            with open(routes_file, encoding="utf-8") as f:
-                routes = [r.get("route_no", "") for r in json.load(f) if r.get("route_no")]
+    # 阶段一：只查静态数据，筛出经过 A→B 的 (route, direction)，结果缓存
+    routes_to_check = get_routes_passing_stations(start_station, end_station, routes)
 
     approaching_start = []  # 即将到达起始站（index < idx_a）
     between_stations = []   # 在两站之间（idx_a < index < idx_b）
     sta_a_name = sta_b_name = ""
 
-    for route in routes:
-        for direction in ("0", "1"):
-            static = get_route_static_data(route, direction)
-            if not static or "routeInfo" not in static:
-                continue
-            route_static = static.get("routeInfo", [])
-
-            # 先检查该方向是否经过 A→B，避免无效的 realtime 请求
-            idx_a = idx_b = -1
-            for i, st in enumerate(route_static):
-                if st.get("staCode") == start_station:
-                    for j in range(i + 1, len(route_static)):
-                        if route_static[j].get("staCode") == end_station:
-                            idx_a, idx_b = i, j
-                            break
-                    if idx_a >= 0:
+    # 阶段二：只对筛选出的路线查实时数据
+    for route, direction in routes_to_check:
+        static = get_route_static_data(route, direction, use_cache=True)
+        if not static or "routeInfo" not in static:
+            continue
+        route_static = static.get("routeInfo", [])
+        idx_a = idx_b = -1
+        for i, st in enumerate(route_static):
+            if st.get("staCode") == start_station:
+                for j in range(i + 1, len(route_static)):
+                    if route_static[j].get("staCode") == end_station:
+                        idx_a, idx_b = i, j
                         break
-            if idx_a < 0 or idx_b < 0:
-                continue
+                break
+        if idx_a < 0 or idx_b < 0:
+            continue
 
-            realtime = get_realtime_bus_data(route, direction)
-            if not realtime or "routeInfo" not in realtime:
-                continue
+        realtime = get_realtime_bus_data(route, direction)
+        if not realtime or "routeInfo" not in realtime:
+            continue
 
-            route_info = realtime.get("routeInfo", [])
-            sta_name_map = {s.get("staCode"): s.get("staName", "") for s in route_static} if route_static else {}
+        route_info = realtime.get("routeInfo", [])
+        sta_name_map = {s.get("staCode"): s.get("staName", "") for s in route_static} if route_static else {}
 
-            if not sta_a_name:
-                st_a = route_info[idx_a]
-                st_b = route_info[idx_b]
-                sta_a_name = st_a.get("staName") or sta_name_map.get(start_station, start_station)
-                sta_b_name = st_b.get("staName") or sta_name_map.get(end_station, end_station)
+        if not sta_a_name:
+            st_a = route_info[idx_a]
+            st_b = route_info[idx_b]
+            sta_a_name = st_a.get("staName") or sta_name_map.get(start_station, start_station)
+            sta_b_name = st_b.get("staName") or sta_name_map.get(end_station, end_station)
 
-            # 分类车辆
-            # 注：busInfo 在站点 i 表示车已离开/即将离开该站，驶向下一站 i+1（路线方向：index 增加）
-            n = len(route_info)
-            for i in range(len(route_info)):
-                st = route_info[i]
-                sta_code = st.get("staCode", "")
-                sta_name = st.get("staName") or sta_name_map.get(sta_code, "")
-                next_idx = (i + 1) % n
-                next_st = route_info[next_idx]
-                next_code = next_st.get("staCode", "")
-                next_name = next_st.get("staName") or sta_name_map.get(next_code, "")
+        # 分类车辆
+        n = len(route_info)
+        for i in range(len(route_info)):
+            st = route_info[i]
+            sta_code = st.get("staCode", "")
+            sta_name = st.get("staName") or sta_name_map.get(sta_code, "")
+            next_idx = (i + 1) % n
+            next_st = route_info[next_idx]
+            next_code = next_st.get("staCode", "")
+            next_name = next_st.get("staName") or sta_name_map.get(next_code, "")
 
-                for bus in st.get("busInfo", []):
-                    plate = bus.get("busPlate", "")
-                    if not plate:
-                        continue
-                    # 车在 当前站 与 下一站 之间，驶向下一站（路线前进方向）
-                    item = {
-                        "route": route,
-                        "busPlate": plate,
-                        "positionBetween": [sta_code, next_code],
-                        "positionBetweenNames": [sta_name, next_name],
-                        "speed": bus.get("speed", ""),
-                        "status": bus.get("status", ""),
-                    }
-                    if i < idx_a:
-                        # 车在 A 之前，驶向 i+1，会经过 A（真正即将到达）
-                        stops_to_start = idx_a - i
-                        item["stopsToStart"] = stops_to_start
-                        sp = None
-                        try:
-                            sp = float(bus.get("speed") or 0)
-                        except (TypeError, ValueError):
-                            pass
-                        eta = estimate_eta_minutes(stops_to_start, sp if sp else None)
-                        if eta is not None:
-                            item["etaToStartMinutes"] = eta
-                        approaching_start.append(item)
-                    elif i > idx_b:
-                        # 已过 B 的车：已驶离 A-B 路段，不再算「即将到达」
-                        # （循环线绕回需很久，用户视角为已离开）
+            for bus in st.get("busInfo", []):
+                plate = bus.get("busPlate", "")
+                if not plate:
+                    continue
+                item = {
+                    "route": route,
+                    "busPlate": plate,
+                    "positionBetween": [sta_code, next_code],
+                    "positionBetweenNames": [sta_name, next_name],
+                    "speed": bus.get("speed", ""),
+                    "status": bus.get("status", ""),
+                }
+                if i < idx_a:
+                    stops_to_start = idx_a - i
+                    item["stopsToStart"] = stops_to_start
+                    sp = None
+                    try:
+                        sp = float(bus.get("speed") or 0)
+                    except (TypeError, ValueError):
                         pass
-                    elif idx_a <= i <= idx_b:
-                        stops_to_end = idx_b - i
-                        item["stopsToEnd"] = stops_to_end
-                        sp = None
-                        try:
-                            sp = float(bus.get("speed") or 0)
-                        except (TypeError, ValueError):
-                            pass
-                        eta = estimate_eta_minutes(stops_to_end, sp if sp else None)
-                        if eta is not None:
-                            item["etaToEndMinutes"] = eta
-                        between_stations.append(item)
+                    eta = estimate_eta_minutes(stops_to_start, sp if sp else None)
+                    if eta is not None:
+                        item["etaToStartMinutes"] = eta
+                    approaching_start.append(item)
+                elif i > idx_b:
+                    pass
+                elif idx_a <= i <= idx_b:
+                    stops_to_end = idx_b - i
+                    item["stopsToEnd"] = stops_to_end
+                    sp = None
+                    try:
+                        sp = float(bus.get("speed") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                    eta = estimate_eta_minutes(stops_to_end, sp if sp else None)
+                    if eta is not None:
+                        item["etaToEndMinutes"] = eta
+                    between_stations.append(item)
 
-            time.sleep(REQUEST_DELAY)
+        time.sleep(REQUEST_DELAY)
 
     return {
         "stationA": {"code": start_station, "name": sta_a_name or start_station},
@@ -461,10 +531,10 @@ def main():
     end = args[2] if len(args) > 2 else None
     direction = args[3] if len(args) > 3 else "0"
 
-    # 常用路线预设：1–4 对应 COMMON_ROUTES
-    if route_arg in ("1", "2", "3", "4"):
+    # 常用路线预设：1–6 对应 COMMON_ROUTES
+    if route_arg in ("1", "2", "3", "4", "5", "6"):
         idx = int(route_arg) - 1
-        start, end = COMMON_ROUTES[idx]
+        start, end = COMMON_ROUTES[idx][0], COMMON_ROUTES[idx][1]
         route_arg = "-s"  # 复用下面的站点模式逻辑
 
     # 仅站点模式：-s / --stations 起始站 结束站
@@ -566,10 +636,10 @@ def main():
 
         print(f"\n完成: {ok_count}/{len(routes)} 条路线有车辆（仅查询，未生成文件）")
 
-    print("\n用法: python fetch_realtime_eta.py <1|2|3|4>           # 常用路线预设")
+    print("\n用法: python fetch_realtime_eta.py <1|2|3|4|5|6>       # 常用路线预设")
     print("      python fetch_realtime_eta.py -s <起始站> <结束站>  # 仅输入两站，查全路线")
     print("      python fetch_realtime_eta.py <路线> <A站> <B站>     # 指定路线查 A→B")
-    print("常用路线: 1=M109→M127  2=M111→M127  3=M127→M170/1  4=M127→M170/2")
+    print("常用路线: 1=提督/高士德→海邊新街  2=昌明花園→海邊新街  3=海邊新街→殷皇子馬路(1)  4=海邊新街→殷皇子馬路(2)  5=提督/高士德→殷皇子馬路(1)  6=昌明花園→殷皇子馬路(2)")
     return 0
 
 
