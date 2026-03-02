@@ -269,14 +269,18 @@ def get_buses_from_a_to_b(
                 plate = bus.get("busPlate", "")
                 if plate and plate not in seen_plates:
                     seen_plates.add(plate)
+                    status_val = str(bus.get("status", ""))
+                    is_at_stop = status_val == "1"  # 1=停靠在当前站，0=当前站到下一站之间行驶
                     # 位置：在 当前站 与 下一站 之间，驶向下一站
                     buses_with_position.append({
                         "busPlate": plate,
                         "positionBetween": [sta_code, next_code],
                         "positionBetweenNames": [sta_name, next_name],
                         "currentStationIndex": i + 1,
+                        "nextStationIndex": next_idx + 1,
+                        "isAtStation": is_at_stop,
                         "speed": bus.get("speed", ""),
-                        "status": bus.get("status", ""),
+                        "status": status_val,
                     })
 
         st_a = route_info[idx_a]
@@ -391,16 +395,72 @@ def get_buses_by_stations_only(
                 plate = bus.get("busPlate", "")
                 if not plate:
                     continue
+                status_val = str(bus.get("status", ""))
+                is_at_stop = status_val == "1"  # 1=停靠在当前站，0=当前站到下一站之间行驶
                 item = {
                     "route": route,
                     "busPlate": plate,
                     "positionBetween": [sta_code, next_code],
                     "positionBetweenNames": [sta_name, next_name],
+                    "currentStationIndex": i + 1,
+                    "nextStationIndex": next_idx + 1,
+                    "isAtStation": is_at_stop,
                     "speed": bus.get("speed", ""),
-                    "status": bus.get("status", ""),
+                    "status": status_val,
                     "passengerFlow": bus.get("passengerFlow", ""),
                 }
-                if i < idx_a:
+                if is_at_stop:
+                    # status=1：停靠在当前站
+                    if i < idx_a:
+                        # 停靠在起点前方，属于「即将到达起点」
+                        stops_to_start = idx_a - i
+                        item["stopsToStart"] = stops_to_start
+                        if route not in _approaching_by_route:
+                            _approaching_by_route[route] = {
+                                "route_info": route_info,
+                                "idx_a": idx_a,
+                                "sta_name_map": sta_name_map,
+                                "buses": [],
+                            }
+                        _approaching_by_route[route]["buses"].append(item)
+                        sp = None
+                        try:
+                            sp = float(bus.get("speed") or 0)
+                        except (TypeError, ValueError):
+                            sp = 0
+                        eta = estimate_eta_minutes(stops_to_start, sp if sp else None)
+                        if eta is not None:
+                            item["etaToStartMinutes"] = eta
+                        approaching_start.append(item)
+                    elif i == idx_a:
+                        # 停靠在起点站
+                        item["stopsToStart"] = 0
+                        if route not in _approaching_by_route:
+                            _approaching_by_route[route] = {
+                                "route_info": route_info,
+                                "idx_a": idx_a,
+                                "sta_name_map": sta_name_map,
+                                "buses": [],
+                            }
+                        _approaching_by_route[route]["buses"].append(item)
+                        item["etaToStartMinutes"] = 0.0
+                        approaching_start.append(item)
+                    elif idx_a < i <= idx_b:
+                        # 停靠在 A-B 区间内某站（含终点）：
+                        # 归入前一段 segment，前端据此显示在该站点左侧
+                        item["stopsToEnd"] = idx_b - i
+                        item["segmentIndex"] = max(0, i - idx_a - 1)
+                        between_stations.append(item)
+                    else:
+                        # 已过终点
+                        pass
+                elif i < idx_a:
+                    # status=0：在当前站与下一站之间行驶，且当前站仍在起点之前 → 即将到达起点
+                    sp = None
+                    try:
+                        sp = float(bus.get("speed") or 0)
+                    except (TypeError, ValueError):
+                        sp = 0
                     stops_to_start = idx_a - i
                     item["stopsToStart"] = stops_to_start
                     if route not in _approaching_by_route:
@@ -411,19 +471,28 @@ def get_buses_by_stations_only(
                             "buses": [],
                         }
                     _approaching_by_route[route]["buses"].append(item)
+                    eta = estimate_eta_minutes(stops_to_start, sp if sp else None)
+                    if eta is not None:
+                        item["etaToStartMinutes"] = eta
+                    approaching_start.append(item)
+                elif i == idx_a:
+                    # status=0：在起点与下一站之间行驶，已离开起点，归入第 0 段
+                    item["stopsToEnd"] = idx_b - i
+                    item["segmentIndex"] = 0
                     sp = None
                     try:
                         sp = float(bus.get("speed") or 0)
                     except (TypeError, ValueError):
                         pass
-                    eta = estimate_eta_minutes(stops_to_start, sp if sp else None)
+                    eta = estimate_eta_minutes(item["stopsToEnd"], sp if sp else None)
                     if eta is not None:
-                        item["etaToStartMinutes"] = eta
-                    approaching_start.append(item)
+                        item["etaToEndMinutes"] = eta
+                    between_stations.append(item)
                 elif i >= idx_b:
-                    # i == idx_b：车在终点站与下一站之间，已驶离终点，不算在路段内
+                    # status=0 且 i==idx_b：车在终点站与下一站之间，已驶离终点，不算在路段内
                     pass
-                elif idx_a <= i < idx_b:
+                elif idx_a < i < idx_b:
+                    # status=0：在 i 与 i+1 之间行驶，归入 segment(i-idx_a)
                     stops_to_end = idx_b - i
                     item["stopsToEnd"] = stops_to_end
                     item["segmentIndex"] = i - idx_a  # 在路段中的第几段（0=起点与第2站之间）
@@ -459,6 +528,9 @@ def get_buses_by_stations_only(
             b["segmentIndex"] = max_stops - b["stopsToStart"]
         approaching_by_route[route] = {"stations": stations, "buses": buses}
 
+    # 起点左侧仅展示「停靠在起点」的车辆，严格按 status=1（isAtStation=True）
+    buses_at_start = [b for b in approaching_start if b.get("stopsToStart") == 0 and b.get("isAtStation")]
+
     return {
         "stationA": {"code": start_station, "name": sta_a_name or start_station},
         "stationB": {"code": end_station, "name": sta_b_name or end_station},
@@ -466,6 +538,7 @@ def get_buses_by_stations_only(
         "approachingByRoute": approaching_by_route,
         "approachingStart": approaching_start,
         "betweenStations": between_stations,
+        "busesAtStart": buses_at_start,
         "totalApproaching": len(approaching_start),
         "totalBetween": len(between_stations),
     }
@@ -537,8 +610,10 @@ def get_eta_for_section(
                     "currentStation": sta_code,
                     "currentStationName": sta_name,
                     "stationIndex": i + 1,
+                    "nextStationIndex": (i + 1) % len(route_info) + 1 if route_info else None,
+                    "isAtStation": str(bus.get("status", "")) == "1",
                     "speed": bus.get("speed", ""),
-                    "status": bus.get("status", ""),  # 1=行驶中 0=到站/待发
+                    "status": bus.get("status", ""),  # 1=到站/待发 0=行驶中
                     "passengerFlow": bus.get("passengerFlow", ""),
                     "isFacilities": bus.get("isFacilities", ""),
                 })
@@ -558,6 +633,7 @@ def get_eta_for_section(
                     "busPlate": b.get("busPlate"),
                     "speed": b.get("speed"),
                     "status": b.get("status"),
+                    "isAtStation": str(b.get("status", "")) == "1",
                 }
                 for b in buses_at_stop
             ],

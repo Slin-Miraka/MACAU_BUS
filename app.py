@@ -15,12 +15,12 @@ from Macau_bus_real_timev1 import (
     get_all_routes,
 )
 
-# 缓存查询结果 10 秒，支持自动刷新
-@st.cache_data(ttl=10)
+# 实时巴士数据缓存 2 秒，缩短以加快状态更新（原 5 秒易导致到站/行驶中显示滞后）
+@st.cache_data(ttl=2)
 def _cached_get_buses_by_stations(start: str, end: str) -> dict:
     return get_buses_by_stations_only(start, end)
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=2)
 def _cached_get_buses_a_to_b(route: str, start: str, end: str) -> dict:
     return get_buses_from_a_to_b(route, start, end)
 
@@ -34,6 +34,42 @@ ROUTE_COLORS = [
     "#0891b2", "#db2777", "#ca8a04", "#0d9488", "#6366f1",
     "#e11d48", "#0284c7", "#65a30d", "#c026d3", "#0f766e",
 ]
+
+
+def _is_at_station(bus: dict) -> bool:
+    """统一判断是否到站：优先使用后端 isAtStation，其次回退到 status=1。"""
+    if "isAtStation" in bus:
+        return bool(bus.get("isAtStation"))
+    return bus.get("status") in (1, "1")
+
+
+def _bus_status_text(bus: dict, at_start_station: bool = False) -> str:
+    """status: 1=到站/待发 0=行驶中。到站时显示当前站（pos[0]）。"""
+    if not _is_at_station(bus):
+        return "行驶中"
+    pos = bus.get("positionBetweenNames", ["", ""])
+    sta = pos[0] or pos[1] or "站点"
+    return f"已到{sta}"
+
+
+def _make_bus_badge(b: dict, at_start_station: bool = False) -> str:
+    """生成路线图中车辆徽章，区分到站/行驶中。完全按 API status，不依赖速度"""
+    pos = b.get("positionBetweenNames", ["", ""])
+    at_stop = _is_at_station(b)
+    dest = pos[0] or pos[1]
+    title = f"{pos[0]} 与 {pos[1]} 之间" if not at_stop else f"已到达 {dest}"
+    status_txt = _bus_status_text(b, at_start_station)
+    extra_cls = " bus-at-stop" if at_stop else ""
+    speed_str = f' {b.get("speed","")}km/h' if b.get("speed") else ""
+    return (
+        f'<span class="bus-badge{extra_cls}" style="background:{_route_color(b["route"])}" title="{title}">'
+        f'<span class="bus-icon">{"⏸️" if at_stop else "🚌"}</span>'
+        f'<span class="route-num">{b["route"]}</span>'
+        f'<span class="bus-status">{status_txt}</span>'
+        f'<span class="plate-speed">{b["busPlate"]}{speed_str}</span></span>'
+    )
+
+
 def _road_congestion_from_speed(speed_val) -> str:
     """根据车速推断所在道路拥挤程度：低速≈拥堵，正常≈顺畅"""
     if speed_val is None or speed_val == "":
@@ -91,34 +127,67 @@ st.markdown("""
         background: #e8f4fc; color: #1e3a5f; padding: 0.5rem 1rem; border-radius: 8px; 
         font-size: 0.95em; font-weight: 500; width: 100%; text-align: center; box-sizing: border-box;
     }
+    .route-stop-row { display: flex; align-items: center; gap: 0.75rem; width: 100%; }
+    .route-stop-buses-left { display: flex; flex-wrap: wrap; gap: 0.3rem; flex-shrink: 0; }
+    .route-stop-row .route-stop { flex: 1; }
     .route-stop.start { background: #22c55e; color: white; }
     .route-stop.end { background: #1e3a5f; color: white; }
     .route-connector { color: #94a3b8; font-size: 1.1em; padding: 0.15rem 0; line-height: 1; }
     .route-segment { 
         display: flex; flex-direction: column; align-items: center; gap: 0.3rem; width: 100%; padding: 0.3rem 0;
     }
+    .route-segment.route-at-stop { padding-top: 0.1rem; }
     .route-segment-buses { display: flex; flex-wrap: wrap; gap: 0.3rem; justify-content: center; }
     .bus-badge { 
-        padding: 0.4rem 0.7rem; border-radius: 8px; font-weight: bold; color: white;
-        display: inline-flex; flex-direction: column; align-items: center; gap: 0.1rem;
+        padding: 0.5rem 0.8rem; border-radius: 10px; font-weight: bold; color: white;
+        display: inline-flex; flex-direction: column; align-items: center; gap: 0.2rem;
         border: 2px solid rgba(255,255,255,0.5); box-shadow: 0 2px 6px rgba(0,0,0,0.25);
     }
-    .bus-badge .route-num { font-size: 1.4em; font-weight: 800; }
+    .bus-badge .bus-icon { font-size: 1.8em; line-height: 1; }
+    .bus-badge .bus-status { font-size: 0.75em; opacity: 0.95; }
+    .bus-badge.bus-at-stop { border-style: dashed; }
+    .bus-badge .route-num { font-size: 1.3em; font-weight: 800; }
     .bus-badge .plate-speed { font-size: 0.8em; opacity: 0.95; }
     .bus-badge.bus-near { background: #fef2f2 !important; color: #dc2626 !important; border-color: #dc2626 !important; box-shadow: 0 0 0 2px #dc2626; }
     .bus-badge.bus-near .route-num, .bus-badge.bus-near .plate-speed { color: #dc2626 !important; font-weight: 800; }
     /* 手机友好： approaching 卡片 */
-    .approaching-card { padding: 1rem 1.25rem; border-radius: 12px; margin: 0.5rem 0; box-shadow: 0 2px 8px rgba(0,0,0,0.12); display: flex; align-items: center; gap: 1rem; min-height: 64px; color: white; }
+    .approaching-card {
+        padding: 1rem 1.25rem;
+        border-radius: 12px;
+        margin: 0.55rem 0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        min-height: 68px;
+        color: white;
+        border-left: 12px solid transparent;
+    }
     .approaching-card .card-route { font-size: 1.5em; font-weight: 800; min-width: 3rem; text-align: center; }
+    .approaching-card .card-bus-icon { font-size: 2em; line-height: 1; }
     .approaching-card .card-info { flex: 1; }
     .approaching-card .card-plate { font-size: 0.9em; opacity: 0.9; }
-    .approaching-card .card-dist-eta { font-size: 1.1em; font-weight: 600; margin-top: 0.2rem; }
-    .approaching-card.card-1stop { background: #fef2f2; border: 2px solid #dc2626; color: #dc2626; }
-    .approaching-card.card-1stop .card-route, .approaching-card.card-1stop .card-dist-eta { color: #dc2626; font-weight: 800; }
-    .approaching-card.card-2stop { background: #dcfce7; border: 2px solid #16a34a; color: #166534; }
-    .approaching-card.card-2stop .card-route, .approaching-card.card-2stop .card-dist-eta { color: #166534; font-weight: 800; }
-    .approaching-card.card-3stop { background: #fff7ed; border: 2px solid #ea580c; color: #c2410c; }
-    .approaching-card.card-3stop .card-route, .approaching-card.card-3stop .card-dist-eta { color: #c2410c; font-weight: 800; }
+    .approaching-card .card-dist-eta { font-size: 1.1em; font-weight: 700; margin-top: 0.2rem; }
+    /* 距离高亮：保留路线主色，同时用外圈强调距离 */
+    .approaching-card .card-dist-tag {
+        display: inline-block;
+        margin-right: 0.55rem;
+        padding: 0.2rem 0.6rem;
+        border-radius: 999px;
+        font-size: 0.88em;
+        font-weight: 900;
+        background: rgba(255,255,255,0.22);
+        color: #fff;
+        border: 1px solid rgba(255,255,255,0.45);
+    }
+    .approaching-card.dist-0 { border-left-color: #0284c7; box-shadow: 0 0 0 3px #0284c7, 0 6px 14px rgba(2,132,199,0.32); }
+    .approaching-card.dist-1 { border-left-color: #dc2626; box-shadow: 0 0 0 3px #dc2626, 0 6px 14px rgba(220,38,38,0.32); }
+    .approaching-card.dist-2 { border-left-color: #16a34a; box-shadow: 0 0 0 3px #16a34a, 0 6px 14px rgba(22,163,74,0.32); }
+    .approaching-card.dist-3 { border-left-color: #ea580c; box-shadow: 0 0 0 3px #ea580c, 0 6px 14px rgba(234,88,12,0.32); }
+    .approaching-card.dist-0 .card-dist-tag { background: #0284c7; }
+    .approaching-card.dist-1 .card-dist-tag { background: #dc2626; }
+    .approaching-card.dist-2 .card-dist-tag { background: #16a34a; }
+    .approaching-card.dist-3 .card-dist-tag { background: #ea580c; }
     div[data-testid="stMetricValue"] { font-size: 1.5rem !important; }
     /* 并排路线列等高，起点底部对齐 */
     div[data-testid="stHorizontalBlock"] { align-items: stretch !important; }
@@ -196,9 +265,9 @@ with col_btn2:
         st.rerun()
 
 
-@st.fragment(run_every=timedelta(seconds=10))
+@st.fragment(run_every=timedelta(seconds=3))
 def _auto_refresh_results():
-    """每 10 秒自动刷新结果"""
+    """每 3 秒自动刷新结果"""  # 与缓存 2 秒配合，保证每次刷新能拿到新数据
     params = st.session_state.get("query_params")
     if not params:
         return
@@ -220,12 +289,14 @@ def _auto_refresh_results():
                 st.success(f"共 {result['totalBuses']} 辆从 {a_name} 开往 {b_name} 的车")
                 for bus in result.get("buses", []):
                     prev_name, curr_name = bus.get("positionBetweenNames", ["?", "?"])
-                    pos_str = f"{prev_name} 与 {curr_name} 之间"
+                    at_stop = _is_at_station(bus)
+                    pos_str = f"已到 {prev_name}" if at_stop else f"{prev_name} 与 {curr_name} 之间"
+                    status_txt = "到站" if at_stop else "行驶中"
                     speed_str = f" {bus.get('speed', '')}km/h" if bus.get("speed") else ""
                     st.markdown(f"""
                     <div class="bus-card">
                         <span class="route">{bus['route']} {bus['busPlate']}</span><br>
-                        <span>{pos_str}{speed_str}</span>
+                        <span>{status_txt} · {pos_str}{speed_str}</span>
                     </div>
                     """, unsafe_allow_html=True)
         else:
@@ -246,7 +317,7 @@ def _auto_refresh_results():
                         stops = int(s) if s is not None else 999
                     except (TypeError, ValueError):
                         stops = 999
-                    if stops in (1, 2, 3):
+                    if stops in (0, 1, 2, 3):
                         eta = b.get("etaToStartMinutes")
                         eta_val = float(eta) if eta is not None else 999.0
                         bus_cards.append((route_name, b, stops, eta_val))
@@ -254,21 +325,28 @@ def _auto_refresh_results():
 
             if bus_cards:
                 for route_name, bus, stops, _ in bus_cards:
-                    card_class = f"approaching-card card-{stops}stop"
+                    # 同一辆车按路线固定颜色，不在 approaching/路线图 间换色
+                    bg_color = _route_color(route_name)
+                    at_stop = _is_at_station(bus)
+                    dist_txt = ("已到起点" if at_stop else "已离开起点") if stops == 0 else f"距{stops}站"
+                    dist_tag = "到站" if stops == 0 else f"{stops}站"
                     speed_txt = bus.get("speed", "")
                     speed_str = f"{speed_txt}km/h" if speed_txt else "—"
                     road_str = _road_congestion_from_speed(speed_txt)
-                    html = f'''<div class="{card_class}">
+                    status_txt = _bus_status_text(bus, at_start_station=(stops == 0))
+                    icon = "⏸️" if at_stop else "🚌"
+                    html = f'''<div class="approaching-card dist-{stops}" style="background:{bg_color};border-color:{bg_color};color:white;">
+                        <span class="card-bus-icon">{icon}</span>
                         <span class="card-route">{route_name}</span>
                         <div class="card-info">
                             <div class="card-plate">{bus.get("busPlate","")}</div>
-                            <div class="card-dist-eta">距{stops}站 · {speed_str} · 道路{road_str}</div>
+                            <div class="card-dist-eta"><span class="card-dist-tag">{dist_tag}</span>{dist_txt} · {status_txt} · {speed_str} · 道路{road_str}</div>
                         </div>
                     </div>'''
                     st.markdown(html, unsafe_allow_html=True)
-                st.caption("仅显示距起点 1～3 站的车，按距离升序。红=1站/绿=2站/橙=3站。显示速度与道路拥挤程度（由车速推断），每 10 秒自动刷新")
+                st.caption("显示距起点 0～3 站的车，按路线固定底色；外圈高亮区分距离（蓝=到站/0站，红=1站，绿=2站，橙=3站）。每 3 秒自动刷新")
             else:
-                st.info("暂无距起点 1～3 站的车，请稍后再试")
+                st.info("暂无距起点 0～3 站的车，请稍后再试")
 
             st.markdown(f'<p class="section-header">【当前在 {a_name} 与 {b_name} 之间运行的车】</p>', unsafe_allow_html=True)
             segment_stations = result.get("segmentStations", [])
@@ -279,21 +357,27 @@ def _auto_refresh_results():
                 for bus in between_buses:
                     seg_idx = bus.get("segmentIndex", 0)
                     buses_by_segment.setdefault(seg_idx, []).append(bus)
+                buses_at_start = result.get("busesAtStart", [])
                 parts = []
                 for i, stop in enumerate(segment_stations):
                     stop_class = "start" if i == 0 else ("end" if i == len(segment_stations) - 1 else "")
-                    parts.append(f'<div class="route-stop {stop_class}">{stop["name"] or stop["code"]}</div>')
+                    buses_at_this = [b for b in buses_at_start if _is_at_station(b)] if (i == 0 and buses_at_start) else []
+                    if i > 0:
+                        # 到站的车在 segment(i-1) 的终点，即 station i（segment 0 终点=站1，segment 1 终点=站2）
+                        buses_in_seg = buses_by_segment.get(i - 1, [])
+                        buses_at_this = [b for b in buses_in_seg if _is_at_station(b)]
+                    if buses_at_this:
+                        bus_badges = "".join([_make_bus_badge(b, at_start_station=(i == 0)) for b in buses_at_this])
+                        parts.append(f'<div class="route-stop-row"><div class="route-stop-buses-left">{bus_badges}</div><div class="route-stop {stop_class}">{stop["name"] or stop["code"]}</div></div>')
+                    else:
+                        parts.append(f'<div class="route-stop {stop_class}">{stop["name"] or stop["code"]}</div>')
                     if i < len(segment_stations) - 1:
                         buses_in_seg = buses_by_segment.get(i, [])
-                        bus_badges = "".join([
-                            f'<span class="bus-badge" style="background:{_route_color(b["route"])}" title="{b.get("positionBetweenNames", ["",""])[0]} 与 {b.get("positionBetweenNames", ["",""])[1]} 之间">'
-                            f'<span class="route-num">{b["route"]}</span>'
-                            f'<span class="plate-speed">{b["busPlate"]}' + (f' {b.get("speed","")}km/h' if b.get("speed") else '') + '</span></span>'
-                            for b in buses_in_seg
-                        ])
+                        buses_moving = [b for b in buses_in_seg if not _is_at_station(b)]
+                        bus_badges = "".join([_make_bus_badge(b) for b in buses_moving])
                         parts.append(f'<div class="route-segment"><span class="route-connector">│</span><span class="route-segment-buses">{bus_badges}</span><span class="route-connector">│</span></div>')
                 st.markdown(f'<div class="route-map-wrapper"><div class="route-timeline">{"".join(parts)}</div></div>', unsafe_allow_html=True)
-                st.caption("路线站点及每段之间的车辆")
+                st.caption("路线站点及每段之间的车辆。⏸️到站的车显示在站点左侧，🚌行驶中的车显示在两站之间")
 
             if result["totalApproaching"] == 0 and result["totalBetween"] == 0:
                 st.info("暂无车辆信息，请稍后再试或更换站点")
