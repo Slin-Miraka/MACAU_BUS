@@ -265,9 +265,9 @@ with col_btn2:
         st.rerun()
 
 
-@st.fragment(run_every=timedelta(seconds=3))
+@st.fragment(run_every=timedelta(seconds=10))
 def _auto_refresh_results():
-    """每 3 秒自动刷新结果"""  # 与缓存 2 秒配合，保证每次刷新能拿到新数据
+    """每 10 秒自动刷新结果"""
     params = st.session_state.get("query_params")
     if not params:
         return
@@ -344,7 +344,7 @@ def _auto_refresh_results():
                         </div>
                     </div>'''
                     st.markdown(html, unsafe_allow_html=True)
-                st.caption("显示距起点 0～3 站的车，按路线固定底色；外圈高亮区分距离（蓝=到站/0站，红=1站，绿=2站，橙=3站）。每 3 秒自动刷新")
+                st.caption("显示距起点 0～3 站的车，按路线固定底色；外圈高亮区分距离（蓝=到站/0站，红=1站，绿=2站，橙=3站）。每 10 秒自动刷新")
             else:
                 st.info("暂无距起点 0～3 站的车，请稍后再试")
 
