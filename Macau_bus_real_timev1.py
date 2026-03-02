@@ -182,8 +182,9 @@ def get_routes_passing_stations(
     with ThreadPoolExecutor(max_workers=STATIC_FETCH_WORKERS) as executor:
         futures = {executor.submit(_task, t): t for t in tasks}
         for future in as_completed(futures):
-            if future.result():
-                passing.append(future.result())
+            res = future.result()
+            if res:
+                passing.append(res)
 
     _routes_passing_cache[cache_key] = passing
     return passing
@@ -320,7 +321,7 @@ def get_buses_by_stations_only(
     _approaching_by_route: dict = {}  # route -> { "route_info", "idx_a", "sta_name_map", "buses" }
 
     # 阶段二：并发获取静态+实时数据
-    def _fetch_route_data(rd: Tuple[str, str]) -> Optional[Tuple[str, str, dict, dict]]:
+    def _fetch_route_data(rd: Tuple[str, str]) -> Optional[Tuple[str, str, int, int, dict, dict]]:
         route, direction = rd
         static = get_route_static_data(route, direction, use_cache=True)
         if not static or "routeInfo" not in static:
@@ -339,9 +340,9 @@ def get_buses_by_stations_only(
         realtime = get_realtime_bus_data(route, direction)
         if not realtime or "routeInfo" not in realtime:
             return None
-        return (route, direction, static, realtime)
+        return (route, direction, idx_a, idx_b, static, realtime)
 
-    route_data_list: List[Tuple[str, str, dict, dict]] = []
+    route_data_list: List[Tuple[str, str, int, int, dict, dict]] = []
     with ThreadPoolExecutor(max_workers=REALTIME_FETCH_WORKERS) as executor:
         futures = {executor.submit(_fetch_route_data, rd): rd for rd in routes_to_check}
         for future in as_completed(futures):
@@ -349,21 +350,17 @@ def get_buses_by_stations_only(
             if res:
                 route_data_list.append(res)
 
-    for route, direction, static, realtime in route_data_list:
+    for route, direction, idx_a, idx_b, static, realtime in route_data_list:
         route_static = static.get("routeInfo", [])
-        idx_a = idx_b = -1
-        for i, st in enumerate(route_static):
-            if st.get("staCode") == start_station:
-                for j in range(i + 1, len(route_static)):
-                    if route_static[j].get("staCode") == end_station:
-                        idx_a, idx_b = i, j
-                        break
-                break
-        if idx_a < 0 or idx_b < 0:
-            continue
 
         route_info = realtime.get("routeInfo", [])
         sta_name_map = {s.get("staCode"): s.get("staName", "") for s in route_static} if route_static else {}
+        route_bucket = _approaching_by_route.setdefault(route, {
+            "route_info": route_info,
+            "idx_a": idx_a,
+            "sta_name_map": sta_name_map,
+            "buses": [],
+        })
 
         if not sta_a_name:
             st_a = route_info[idx_a]
@@ -384,6 +381,9 @@ def get_buses_by_stations_only(
         n = len(route_info)
         for i in range(len(route_info)):
             st = route_info[i]
+            bus_list = st.get("busInfo", [])
+            if not bus_list:
+                continue
             sta_code = st.get("staCode", "")
             sta_name = st.get("staName") or sta_name_map.get(sta_code, "")
             next_idx = (i + 1) % n
@@ -391,7 +391,7 @@ def get_buses_by_stations_only(
             next_code = next_st.get("staCode", "")
             next_name = next_st.get("staName") or sta_name_map.get(next_code, "")
 
-            for bus in st.get("busInfo", []):
+            for bus in bus_list:
                 plate = bus.get("busPlate", "")
                 if not plate:
                     continue
@@ -415,14 +415,7 @@ def get_buses_by_stations_only(
                         # 停靠在起点前方，属于「即将到达起点」
                         stops_to_start = idx_a - i
                         item["stopsToStart"] = stops_to_start
-                        if route not in _approaching_by_route:
-                            _approaching_by_route[route] = {
-                                "route_info": route_info,
-                                "idx_a": idx_a,
-                                "sta_name_map": sta_name_map,
-                                "buses": [],
-                            }
-                        _approaching_by_route[route]["buses"].append(item)
+                        route_bucket["buses"].append(item)
                         sp = None
                         try:
                             sp = float(bus.get("speed") or 0)
@@ -435,14 +428,7 @@ def get_buses_by_stations_only(
                     elif i == idx_a:
                         # 停靠在起点站
                         item["stopsToStart"] = 0
-                        if route not in _approaching_by_route:
-                            _approaching_by_route[route] = {
-                                "route_info": route_info,
-                                "idx_a": idx_a,
-                                "sta_name_map": sta_name_map,
-                                "buses": [],
-                            }
-                        _approaching_by_route[route]["buses"].append(item)
+                        route_bucket["buses"].append(item)
                         item["etaToStartMinutes"] = 0.0
                         approaching_start.append(item)
                     elif idx_a < i <= idx_b:
@@ -463,14 +449,7 @@ def get_buses_by_stations_only(
                         sp = 0
                     stops_to_start = idx_a - i
                     item["stopsToStart"] = stops_to_start
-                    if route not in _approaching_by_route:
-                        _approaching_by_route[route] = {
-                            "route_info": route_info,
-                            "idx_a": idx_a,
-                            "sta_name_map": sta_name_map,
-                            "buses": [],
-                        }
-                    _approaching_by_route[route]["buses"].append(item)
+                    route_bucket["buses"].append(item)
                     eta = estimate_eta_minutes(stops_to_start, sp if sp else None)
                     if eta is not None:
                         item["etaToStartMinutes"] = eta
@@ -513,6 +492,8 @@ def get_buses_by_stations_only(
         idx_a = data["idx_a"]
         name_map = data["sta_name_map"]
         buses = data["buses"]
+        if not buses:
+            continue
         max_stops = max(b["stopsToStart"] for b in buses)
         start_idx = max(0, idx_a - max_stops)
         stations = []
