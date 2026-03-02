@@ -21,8 +21,9 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
     "Referer": "https://bis.dsat.gov.mo/macauweb/",
 }
-REQUEST_DELAY = 0.3  # 请求间隔，避免过快
+REQUEST_DELAY = 0.15  # 串行时的请求间隔
 STATIC_FETCH_WORKERS = 6  # 并发获取静态数据的线程数
+REALTIME_FETCH_WORKERS = 8  # 并发获取实时数据的线程数
 
 # 缓存：静态数据 (route, dir) -> data；路线筛选 (start, end) -> [(route, dir), ...]
 _static_cache: dict = {}
@@ -310,12 +311,41 @@ def get_buses_by_stations_only(
     approaching_start = []  # 即将到达起始站（index < idx_a）
     between_stations = []   # 在两站之间（idx_a < index < idx_b）
     sta_a_name = sta_b_name = ""
+    segment_stations: List[dict] = []  # 起点到终点之间的所有站点（含起终点）
+    # 按路线分别存储：每条路线有各自的站点序列（101、3、3X 走不同线路）
+    _approaching_by_route: dict = {}  # route -> { "route_info", "idx_a", "sta_name_map", "buses" }
 
-    # 阶段二：只对筛选出的路线查实时数据
-    for route, direction in routes_to_check:
+    # 阶段二：并发获取静态+实时数据
+    def _fetch_route_data(rd: Tuple[str, str]) -> Optional[Tuple[str, str, dict, dict]]:
+        route, direction = rd
         static = get_route_static_data(route, direction, use_cache=True)
         if not static or "routeInfo" not in static:
-            continue
+            return None
+        route_static = static.get("routeInfo", [])
+        idx_a = idx_b = -1
+        for i, st in enumerate(route_static):
+            if st.get("staCode") == start_station:
+                for j in range(i + 1, len(route_static)):
+                    if route_static[j].get("staCode") == end_station:
+                        idx_a, idx_b = i, j
+                        break
+                break
+        if idx_a < 0 or idx_b < 0:
+            return None
+        realtime = get_realtime_bus_data(route, direction)
+        if not realtime or "routeInfo" not in realtime:
+            return None
+        return (route, direction, static, realtime)
+
+    route_data_list: List[Tuple[str, str, dict, dict]] = []
+    with ThreadPoolExecutor(max_workers=REALTIME_FETCH_WORKERS) as executor:
+        futures = {executor.submit(_fetch_route_data, rd): rd for rd in routes_to_check}
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                route_data_list.append(res)
+
+    for route, direction, static, realtime in route_data_list:
         route_static = static.get("routeInfo", [])
         idx_a = idx_b = -1
         for i, st in enumerate(route_static):
@@ -328,10 +358,6 @@ def get_buses_by_stations_only(
         if idx_a < 0 or idx_b < 0:
             continue
 
-        realtime = get_realtime_bus_data(route, direction)
-        if not realtime or "routeInfo" not in realtime:
-            continue
-
         route_info = realtime.get("routeInfo", [])
         sta_name_map = {s.get("staCode"): s.get("staName", "") for s in route_static} if route_static else {}
 
@@ -340,6 +366,15 @@ def get_buses_by_stations_only(
             st_b = route_info[idx_b]
             sta_a_name = st_a.get("staName") or sta_name_map.get(start_station, start_station)
             sta_b_name = st_b.get("staName") or sta_name_map.get(end_station, end_station)
+            # 收集路段内所有站点（起点到终点）
+            if not segment_stations:
+                for k in range(idx_a, idx_b + 1):
+                    s = route_info[k]
+                    segment_stations.append({
+                        "code": s.get("staCode", ""),
+                        "name": s.get("staName") or sta_name_map.get(s.get("staCode", ""), ""),
+                        "index": k - idx_a,
+                    })
 
         # 分类车辆
         n = len(route_info)
@@ -363,10 +398,19 @@ def get_buses_by_stations_only(
                     "positionBetweenNames": [sta_name, next_name],
                     "speed": bus.get("speed", ""),
                     "status": bus.get("status", ""),
+                    "passengerFlow": bus.get("passengerFlow", ""),
                 }
                 if i < idx_a:
                     stops_to_start = idx_a - i
                     item["stopsToStart"] = stops_to_start
+                    if route not in _approaching_by_route:
+                        _approaching_by_route[route] = {
+                            "route_info": route_info,
+                            "idx_a": idx_a,
+                            "sta_name_map": sta_name_map,
+                            "buses": [],
+                        }
+                    _approaching_by_route[route]["buses"].append(item)
                     sp = None
                     try:
                         sp = float(bus.get("speed") or 0)
@@ -376,11 +420,13 @@ def get_buses_by_stations_only(
                     if eta is not None:
                         item["etaToStartMinutes"] = eta
                     approaching_start.append(item)
-                elif i > idx_b:
+                elif i >= idx_b:
+                    # i == idx_b：车在终点站与下一站之间，已驶离终点，不算在路段内
                     pass
-                elif idx_a <= i <= idx_b:
+                elif idx_a <= i < idx_b:
                     stops_to_end = idx_b - i
                     item["stopsToEnd"] = stops_to_end
+                    item["segmentIndex"] = i - idx_a  # 在路段中的第几段（0=起点与第2站之间）
                     sp = None
                     try:
                         sp = float(bus.get("speed") or 0)
@@ -391,11 +437,33 @@ def get_buses_by_stations_only(
                         item["etaToEndMinutes"] = eta
                     between_stations.append(item)
 
-        time.sleep(REQUEST_DELAY)
+    # 按路线分别构建「即将到达」的路线图（每条路线独立显示其站点序列）
+    approaching_by_route: dict = {}
+    for route, data in _approaching_by_route.items():
+        route_info = data["route_info"]
+        idx_a = data["idx_a"]
+        name_map = data["sta_name_map"]
+        buses = data["buses"]
+        max_stops = max(b["stopsToStart"] for b in buses)
+        start_idx = max(0, idx_a - max_stops)
+        stations = []
+        for k in range(start_idx, idx_a + 1):
+            s = route_info[k]
+            code = s.get("staCode", "")
+            stations.append({
+                "code": code,
+                "name": s.get("staName") or name_map.get(code, ""),
+                "stopsToStart": idx_a - k,
+            })
+        for b in buses:
+            b["segmentIndex"] = max_stops - b["stopsToStart"]
+        approaching_by_route[route] = {"stations": stations, "buses": buses}
 
     return {
         "stationA": {"code": start_station, "name": sta_a_name or start_station},
         "stationB": {"code": end_station, "name": sta_b_name or end_station},
+        "segmentStations": segment_stations,
+        "approachingByRoute": approaching_by_route,
         "approachingStart": approaching_start,
         "betweenStations": between_stations,
         "totalApproaching": len(approaching_start),
