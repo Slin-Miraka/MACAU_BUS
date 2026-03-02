@@ -335,7 +335,7 @@ def _auto_refresh_results():
                     road_str = _road_congestion_from_speed(speed_txt)
                     status_txt = _bus_status_text(bus, at_start_station=(stops == 0))
                     icon = "⏸️" if at_stop else "🚌"
-                    html = f'''<div class="approaching-card dist-{stops}" style="background:{bg_color};border-color:{bg_color};color:white;">
+                    html = f'''<div class="approaching-card dist-{stops}" style="background:#ffffff;border:2px solid {bg_color};color:#0f172a;">
                         <span class="card-bus-icon">{icon}</span>
                         <span class="card-route">{route_name}</span>
                         <div class="card-info">
