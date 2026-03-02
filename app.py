@@ -127,7 +127,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🚌 澳门巴士实时报站")
+st.title("🚌 澳门打工仔的公交助手")
 st.caption("数据来源：澳门 BIS 巴士报站系统")
 
 # 侧边栏：查询模式
