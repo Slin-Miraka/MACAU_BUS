@@ -70,21 +70,6 @@ def _make_bus_badge(b: dict, at_start_station: bool = False) -> str:
     )
 
 
-def _road_congestion_from_speed(speed_val) -> str:
-    """根据车速推断所在道路拥挤程度：低速≈拥堵，正常≈顺畅"""
-    if speed_val is None or speed_val == "":
-        return "—"
-    try:
-        speed = float(speed_val)
-    except (TypeError, ValueError):
-        return "—"
-    if speed < 10:
-        return "拥堵"
-    if speed < 20:
-        return "一般"
-    return "顺畅"
-
-
 def _route_color(route: str) -> str:
     # 按字符位置加权求和，减少不同路线撞色
     h = sum((i + 1) * ord(c) for i, c in enumerate(str(route))) % len(ROUTE_COLORS)
@@ -332,7 +317,6 @@ def _auto_refresh_results():
                     dist_tag = "到站" if stops == 0 else f"{stops}站"
                     speed_txt = bus.get("speed", "")
                     speed_str = f"{speed_txt}km/h" if speed_txt else "—"
-                    road_str = _road_congestion_from_speed(speed_txt)
                     status_txt = _bus_status_text(bus, at_start_station=(stops == 0))
                     icon = "⏸️" if at_stop else "🚌"
                     html = f'''<div class="approaching-card dist-{stops}" style="background:#ffffff;border:2px solid {bg_color};color:#0f172a;">
@@ -340,7 +324,7 @@ def _auto_refresh_results():
                         <span class="card-route">{route_name}</span>
                         <div class="card-info">
                             <div class="card-plate">{bus.get("busPlate","")}</div>
-                            <div class="card-dist-eta"><span class="card-dist-tag">{dist_tag}</span>{dist_txt} · {status_txt} · {speed_str} · 道路{road_str}</div>
+                            <div class="card-dist-eta"><span class="card-dist-tag">{dist_tag}</span>{dist_txt} · {status_txt} · {speed_str}</div>
                         </div>
                     </div>'''
                     st.markdown(html, unsafe_allow_html=True)
